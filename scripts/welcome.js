@@ -74,9 +74,13 @@ const handleRepoCreateError = (statusCode, name) => {
 };
 
 const createRepo = async (token, name) => {
+  // Replace forward slashes with dashes for repository name
+  // Since GitHub repositories can't have forward slashes
+  const repoName = name.replace(/\//g, '-');
+  
   const AUTHENTICATION_URL = 'https://api.github.com/user/repos';
   let data = {
-    name,
+    name: repoName,
     private: true,
     auto_init: true,
     description: createRepoDescription,
@@ -93,16 +97,21 @@ const createRepo = async (token, name) => {
 
   let res = await fetch(AUTHENTICATION_URL, options);
   if (!res.ok) {
-    return handleRepoCreateError(res.status, name);
+    return handleRepoCreateError(res.status, repoName);
   }
   res = await res.json();
 
   /* Set Repo Hook, and set mode type to commit */
-  api.storage.local.set({ mode_type: 'commit', leethub_hook: res.full_name });
+  /* Store both the original name with slashes and the GitHub repo name */
+  api.storage.local.set({ 
+    mode_type: 'commit', 
+    leethub_hook: res.full_name,
+    leethub_path: name.includes('/') ? name.substring(name.indexOf('/') + 1) : '' 
+  });
   await api.storage.local.remove('stats');
   $('#error').hide();
   $('#success').html(
-    `Successfully created <a target="blank" href="${res.html_url}">${name}</a>. Start <a href="http://leetcode.com">LeetCoding</a>!`
+    `Successfully created <a target="blank" href="${res.html_url}">${repoName}</a>. Start <a href="http://leetcode.com">LeetCoding</a>!`
   );
   $('#success').show();
   $('#unlink').show();
@@ -135,7 +144,24 @@ const handleLinkRepoError = (statusCode, name) => {
     2. Link Hook to it (chrome Storage).
 */
 const linkRepo = (token, name) => {
-  const AUTHENTICATION_URL = `https://api.github.com/repos/${name}`;
+  // Check if the name contains directory paths
+  let leethub_path = '';
+  let repo_name = name;
+  
+  // If the repository name includes a path structure
+  if (name.includes('/')) {
+    const parts = name.split('/');
+    // First part is username, second is repository name
+    // If there are more parts, they represent path inside the repository
+    if (parts.length > 2) {
+      // Extract the username/repo-name part
+      repo_name = `${parts[0]}/${parts[1]}`;
+      // Extract the path part (everything after username/repo-name)
+      leethub_path = parts.slice(2).join('/');
+    }
+  }
+
+  const AUTHENTICATION_URL = `https://api.github.com/repos/${repo_name}`;
 
   const xhr = new XMLHttpRequest();
   xhr.addEventListener('readystatechange', function () {
@@ -146,9 +172,9 @@ const linkRepo = (token, name) => {
       // BUG FIX
       // unable to gain access to repo in commit mode. Must switch to hook mode.
       /* Set mode type to hook and Repo Hook to NONE */
-      handleLinkRepoError(xhr.status, name);
+      handleLinkRepoError(xhr.status, repo_name);
       api.storage.local.set({ mode_type: 'hook', leethub_hook: null }, () => {
-        console.log(`Error linking ${name} to LeetHub`);
+        console.log(`Error linking ${repo_name} to LeetHub`);
         console.log('Defaulted repo hook to NONE');
       });
 
@@ -160,11 +186,16 @@ const linkRepo = (token, name) => {
 
     const res = JSON.parse(xhr.responseText);
     api.storage.local.set(
-      { mode_type: 'commit', repo: res.html_url, leethub_hook: res.full_name },
+      { 
+        mode_type: 'commit', 
+        repo: res.html_url, 
+        leethub_hook: res.full_name,
+        leethub_path: leethub_path 
+      },
       () => {
         $('#error').hide();
         $('#success').html(
-          `Successfully linked <a target="blank" href="${res.html_url}">${name}</a> to LeetHub. Start <a href="http://leetcode.com">LeetCoding</a> now!`
+          `Successfully linked <a target="blank" href="${res.html_url}">${repo_name}</a> to LeetHub. Start <a href="http://leetcode.com">LeetCoding</a> now!`
         );
         $('#success').show();
         $('#unlink').show();
@@ -198,7 +229,7 @@ const linkRepo = (token, name) => {
 const unlinkRepo = () => {
   /* Reset mode type to hook, stats to null */
   api.storage.local.set(
-    { mode_type: 'hook', leethub_hook: null, sync_stats: true, stats: null },
+    { mode_type: 'hook', leethub_hook: null, sync_stats: true, stats: null, leethub_path: null },
     () => {
       console.log(`Unlinked repo`);
       console.log('Cleared local stats');

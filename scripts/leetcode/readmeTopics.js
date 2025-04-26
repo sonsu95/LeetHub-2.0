@@ -1,11 +1,20 @@
 import { LeetHubError } from "./util.js";
+import { getBrowser } from "./util.js";
 
+const api = getBrowser();
 const leetCodeSectionStart = `<!---LeetCode Topics Start-->`;
 const leetCodeSectionHeader = `# LeetCode Topics`;
 const leetCodeSectionEnd = `<!---LeetCode Topics End-->`;
 
-function appendProblemToReadme(topic, markdownFile, hook, problem) {
-  const url = `https://github.com/${hook}/tree/master/${problem}`;
+async function appendProblemToReadme(topic, markdownFile, hook, problem) {
+  // Get the subfolder path from storage
+  const { leethub_path } = await api.storage.local.get('leethub_path');
+  const subfolderPath = leethub_path || '';
+  
+  // Create the URL with subfolder path if it exists
+  const urlPath = subfolderPath ? `${subfolderPath}/${problem}` : problem;
+  const url = `https://github.com/${hook}/tree/master/${urlPath}`;
+  
   const topicHeader = `## ${topic}`;
   const topicTableHeader = `\n${topicHeader}\n|  |\n| ------- |\n`;
   const newRow = `| [${problem}](${url}) |`;

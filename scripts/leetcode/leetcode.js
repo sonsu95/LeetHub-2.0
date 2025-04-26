@@ -34,12 +34,27 @@ const api = getBrowser();
 /**
  * Constructs a file path by appending the given filename to the problem directory.
  * If no filename is provided, it returns the problem name as the path.
+ * Also considers any subfolder path stored in leethub_path in chrome.storage.
  *
  * @param {string} problem - The base problem directory or the entire file path if no filename is provided.
  * @param {string} [filename] - Optional parameter for the filename to be appended to the problem directory.
+ * @param {string} [subfolderPath] - Optional parameter for subfolder path to prepend.
+ * @param {boolean} [forceRoot] - Force path to be in root directory.
  * @returns {string} - Returns a string representing the complete file path, either with or without the appended filename.
  */
-const getPath = (problem, filename) => {
+const getPath = (problem, filename, subfolderPath, forceRoot) => {
+  // Force to root directory if specified
+  if (forceRoot) {
+    return filename ? `${problem}/${filename}` : problem;
+  }
+  
+  // If we have a subfolder path
+  if (subfolderPath) {
+    // Place all files (including README.md and stats.json) in the subfolder structure
+    return filename ? `${subfolderPath}/${problem}/${filename}` : `${subfolderPath}/${problem}`;
+  }
+  
+  // Original behavior without subfolders
   return filename ? `${problem}/${filename}` : problem;
 };
 
@@ -65,13 +80,18 @@ const encode = data => btoa(unescape(encodeURIComponent(data)));
  * @param {string} sha - The SHA of the existing file.
  * @param {string} message - A commit message describing the change.
  * @param {string} [difficulty] - The difficulty level of the problem.
+ * @param {boolean} [forceRoot] - Whether to force the file to be in the root directory.
  *
  * @returns {Promise<string>} - A promise that resolves with the new SHA of the content after successful upload.
  *
  * @throws {LeetHubError} - Throws an error if the response is not OK (e.g., HTTP status code is not `200-299`).
  */
-const upload = async (token, hook, content, problem, filename, sha, message) => {
-  const path = getPath(problem, filename);
+const upload = async (token, hook, content, problem, filename, sha, message, difficulty, forceRoot) => {
+  // Get subfolder path if set
+  const { leethub_path } = await api.storage.local.get('leethub_path');
+  const subfolderPath = leethub_path || '';
+  
+  const path = getPath(problem, filename, subfolderPath, forceRoot);
   const URL = `https://api.github.com/repos/${hook}/contents/${path}`;
 
   let data = {
@@ -93,7 +113,7 @@ const upload = async (token, hook, content, problem, filename, sha, message) => 
   if (!res.ok) {
     throw new LeetHubError(res.status, { cause: res });
   }
-  console.log(`Successfully committed ${getPath(problem, filename)} to github`);
+  console.log(`Successfully committed ${getPath(problem, filename, subfolderPath, forceRoot)} to github`);
 
   const body = await res.json();
   //TODO: Think, should we be setting stats state here?
@@ -133,6 +153,36 @@ const getAndInitializeStats = problem => {
 const incrementStats = (difficulty, problem) => {
   const diff = getDifficulty(difficulty);
   return api.storage.local.get('stats').then(({ stats }) => {
+    // stats object initialization may be needed
+    if (!stats) {
+      stats = {};
+    }
+    if (!stats.shas) {
+      stats.shas = {};
+    }
+    if (!stats.solved) {
+      stats.solved = 0;
+    }
+    if (!stats.easy) {
+      stats.easy = 0;
+    }
+    if (!stats.medium) {
+      stats.medium = 0;
+    }
+    if (!stats.hard) {
+      stats.hard = 0;
+    }
+    
+    // Check for stats.shas[statsFilename] initialization - may be needed
+    if (!stats.shas[statsFilename]) {
+      stats.shas[statsFilename] = {};
+    }
+    
+    // Initialize shas for each problem
+    if (!stats.shas[problem]) {
+      stats.shas[problem] = {};
+    }
+    
     stats.solved += 1;
     stats.easy += diff === DIFFICULTY.EASY ? 1 : 0;
     stats.medium += diff === DIFFICULTY.MEDIUM ? 1 : 0;
@@ -154,19 +204,21 @@ const incrementStats = (difficulty, problem) => {
 const setPersistentStats = async localStats => {
   let pStats = { leetcode: localStats };
   const pStatsEncoded = encode(JSON.stringify(pStats));
-  const sha = localStats?.shas?.[readmeFilename]?.[''] || '';
+  const sha = localStats?.shas?.[statsFilename]?.[''] || '';
 
-  const { leethub_token: token, leethub_hook: hook } = await api.storage.local.get([
+  const { leethub_token, leethub_hook } = await api.storage.local.get([
     'leethub_token',
     'leethub_hook',
   ]);
 
   try {
-    return await upload(token, hook, pStatsEncoded, statsFilename, '', sha, updateStatsMsg);
+    // Set forceRoot parameter to false to save stats.json in subfolder
+    return await upload(leethub_token, leethub_hook, pStatsEncoded, statsFilename, '', sha, updateStatsMsg, '', false);
   } catch (e) {
     if (e.message === '409') {
       // Stats were updated on GitHub since last submission
-      const { content, sha } = await getGitHubFile(token, hook, statsFilename).then(res =>
+      // Get file from the proper subfolder location
+      const { content, sha } = await getGitHubFile(leethub_token, leethub_hook, statsFilename, '', '', false).then(res =>
         res.json()
       );
       pStats = JSON.parse(decode(content));
@@ -177,7 +229,8 @@ const setPersistentStats = async localStats => {
       await api.storage.local.set({ stats: mergedStats });
 
       return await delay(
-        () => upload(token, hook, mergedStatsEncoded, statsFilename, '', sha, updateStatsMsg),
+        // Also set forceRoot to false here
+        () => upload(leethub_token, leethub_hook, mergedStatsEncoded, statsFilename, '', sha, updateStatsMsg, '', false),
         WAIT_FOR_GITHUB_API_TO_NOT_THROW_409_MS
       );
     }
@@ -207,12 +260,15 @@ const updateReadmeWithDiscussionPost = async (
   shouldPreprendDiscussionPosts
 ) => {
   let responseSHA;
-  const { leethub_token, leethub_hook } = await api.storage.local.get([
+  const { leethub_token, leethub_hook, leethub_path } = await api.storage.local.get([
     'leethub_token',
     'leethub_hook',
+    'leethub_path'
   ]);
+  
+  const subfolderPath = leethub_path || '';
 
-  return getGitHubFile(leethub_token, leethub_hook, directory, filename)
+  return getGitHubFile(leethub_token, leethub_hook, directory, filename, subfolderPath, true)
     .then(resp => resp.json())
     .then(data => {
       responseSHA = data.sha;
@@ -222,7 +278,7 @@ const updateReadmeWithDiscussionPost = async (
       shouldPreprendDiscussionPosts ? encode(addition + existingContent) : encode(existingContent)
     )
     .then(newContent =>
-      upload(leethub_token, leethub_hook, newContent, directory, filename, responseSHA, commitMsg)
+      upload(leethub_token, leethub_hook, newContent, directory, filename, responseSHA, commitMsg, '', true)
     );
 };
 
@@ -237,6 +293,7 @@ const updateReadmeWithDiscussionPost = async (
  * @param {Object} [optionals] - Optional parameters for updating stats
  * @param {string} optionals.sha - The SHA value of the existing content to be updated (optional).
  * @param {DIFFICULTY} optionals.difficulty - The difficulty level of the problem (optional).
+ * @param {boolean} optionals.forceRoot - Whether to force the file to be in the root directory (optional).
  *
  * @returns {Promise<string>} A promise that resolves with the new SHA of the content after successful upload.
  *
@@ -283,11 +340,20 @@ async function uploadGitWith409Retry(code, problemName, filename, commitMsg, opt
       filename,
       sha,
       commitMsg,
-      optionals?.difficulty
+      optionals?.difficulty,
+      optionals?.forceRoot
     );
   } catch (err) {
     if (err.message === '409') {
-      const data = await getGitHubFile(token, hook, problemName, filename).then(res => res.json());
+      const data = await getGitHubFile(
+        token, 
+        hook, 
+        problemName, 
+        filename, 
+        '', 
+        optionals?.forceRoot
+      ).then(res => res.json());
+      
       return upload(
         token,
         hook,
@@ -296,7 +362,8 @@ async function uploadGitWith409Retry(code, problemName, filename, commitMsg, opt
         filename,
         data.sha,
         commitMsg,
-        optionals?.difficulty
+        optionals?.difficulty,
+        optionals?.forceRoot
       );
     }
     throw err;
@@ -310,11 +377,19 @@ async function uploadGitWith409Retry(code, problemName, filename, commitMsg, opt
  * @param {string} hook - The owner and repository name in the format "owner/repository".
  * @param {string} directory - The directory within the repository where the file is located.
  * @param {string} filename - The name of the file to be fetched.
+ * @param {string} [subfolderPath] - Optional subfolder path to prepend.
+ * @param {boolean} [forceRoot] - Whether to force getting the file from the root directory.
  * @returns {Promise<Response>} A promise that resolves with the response from the GitHub API request.
  * @throws {Error} Throws an error if the response is not OK (e.g., HTTP status code is not 200-299).
  */
-async function getGitHubFile(token, hook, directory, filename) {
-  const path = getPath(directory, filename);
+async function getGitHubFile(token, hook, directory, filename, subfolderPath, forceRoot) {
+  // Get subfolder path if not provided
+  if (subfolderPath === undefined) {
+    const { leethub_path } = await api.storage.local.get('leethub_path');
+    subfolderPath = leethub_path || '';
+  }
+  
+  const path = getPath(directory, filename, subfolderPath, forceRoot);
   const URL = `https://api.github.com/repos/${hook}/contents/${path}`;
 
   let options = {
@@ -364,9 +439,48 @@ document.addEventListener('click', event => {
   }
 });
 
-function createRepoReadme() {
+async function createRepoReadme() {
   const content = encode(defaultRepoReadme);
-  return uploadGitWith409Retry(content, readmeFilename, '', readmeMsg);
+  
+  // Create two READMEs - one in root and one in subfolder if needed
+  const { leethub_path } = await api.storage.local.get('leethub_path');
+  const subfolderPath = leethub_path || '';
+  
+  // Always create the root README
+  const rootSha = await uploadGitWith409Retry(content, readmeFilename, '', readmeMsg, { forceRoot: true });
+  
+  // If a subfolder is specified, also create README there
+  if (subfolderPath) {
+    const subfolderReadmeContent = encode(`# LeetCode Problems\n\nA collection of LeetCode problems solved in this folder.\n\n<!---LeetCode Topics Start-->\n# LeetCode Topics\n<!---LeetCode Topics End-->`);
+    await uploadGitWith409Retry(subfolderReadmeContent, readmeFilename, '', readmeMsg);
+  }
+  
+  return rootSha;
+}
+
+async function createSubfolderReadme() {
+  const { leethub_token, leethub_hook, leethub_path } = await api.storage.local.get([
+    'leethub_token',
+    'leethub_hook',
+    'leethub_path'
+  ]);
+  
+  if (!leethub_path) return null;
+  
+  const subfolderReadmeContent = encode(`# LeetCode Problems\n\nA collection of LeetCode problems solved in this folder.\n\n<!---LeetCode Topics Start-->\n# LeetCode Topics\n<!---LeetCode Topics End-->`);
+  try {
+    const sha = await uploadGitWith409Retry(
+      subfolderReadmeContent, 
+      readmeFilename, 
+      '', 
+      readmeMsg, 
+      { forceRoot: false }
+    );
+    return sha;
+  } catch (err) {
+    console.error('Failed to create subfolder README:', err);
+    return null;
+  }
 }
 
 async function updateReadmeTopicTagsWithProblem(topicTags, problemName) {
@@ -375,39 +489,76 @@ async function updateReadmeTopicTagsWithProblem(topicTags, problemName) {
     return;
   }
 
-  const { leethub_token, leethub_hook, stats } = await api.storage.local.get([
+  // We only need to update the subfolder README
+  const { leethub_token, leethub_hook, stats, leethub_path } = await api.storage.local.get([
     'leethub_token',
     'leethub_hook',
     'stats',
+    'leethub_path'
   ]);
+  
+  // If no subfolder specified, there's nothing to do
+  if (!leethub_path) return;
+  
+  const subfolderPath = leethub_path;
+  let subfolderReadme;
+  let subfolderSha;
 
-  let readme;
-  let newSha;
-
+  // Try to get existing subfolder README
   try {
     const { content, sha } = await getGitHubFile(
       leethub_token,
       leethub_hook,
-      readmeFilename
+      readmeFilename,
+      '',
+      subfolderPath,
+      false // Not forcing root
     ).then(resp => resp.json());
-    readme = content;
-    stats.shas[readmeFilename] = { '': sha };
-    await api.storage.local.set({ stats });
+    
+    subfolderReadme = decode(content);
+    subfolderSha = sha;
+    
   } catch (err) {
     if (err.message === '404') {
-      newSha = await createRepoReadme();
+      // Create subfolder README if it doesn't exist
+      subfolderSha = await createSubfolderReadme();
+      try {
+        const { content } = await getGitHubFile(
+          leethub_token,
+          leethub_hook,
+          readmeFilename,
+          '',
+          subfolderPath,
+          false
+        ).then(resp => resp.json());
+        
+        subfolderReadme = decode(content);
+      } catch (innerErr) {
+        console.error('Failed to get subfolder README after creation:', innerErr);
+        return;
+      }
+    } else {
+      console.error('Error getting subfolder README:', err);
+      return;
     }
-    throw err;
   }
-  readme = decode(readme);
-  for (let topic of topicTags) {
-    readme = appendProblemToReadme(topic.name, readme, leethub_hook, problemName);
-  }
-  readme = sortTopicsInReadme(readme);
-  readme = encode(readme);
 
+  // Update subfolder README with topic tags
+  for (let topic of topicTags) {
+    subfolderReadme = await appendProblemToReadme(topic.name, subfolderReadme, leethub_hook, problemName);
+  }
+  subfolderReadme = sortTopicsInReadme(subfolderReadme);
+  subfolderReadme = encode(subfolderReadme);
+
+  // Upload updated subfolder README
   return delay(
-    () => uploadGitWith409Retry(readme, readmeFilename, '', updateReadmeMsg, { sha: newSha }),
+    () => uploadGitWith409Retry(
+      subfolderReadme, 
+      readmeFilename, 
+      '', 
+      updateReadmeMsg, 
+      { sha: subfolderSha, forceRoot: false }
+    ),
     WAIT_FOR_GITHUB_API_TO_NOT_THROW_409_MS
   );
 }
@@ -453,15 +604,17 @@ function loader(leetCode) {
       const filename = problemName + language;
 
       /* Upload README */
-      const uploadReadMe = await api.storage.local.get('stats').then(({ stats }) => {
+      const uploadReadMe = await api.storage.local.get(['stats', 'leethub_path']).then(({ stats, leethub_path }) => {
         const shaExists = stats?.shas?.[problemName]?.[readmeFilename] !== undefined;
 
         if (!shaExists) {
+          // Only upload README to problem folder, not to root
           return uploadGitWith409Retry(
             encode(probStatement),
             problemName,
             readmeFilename,
-            readmeMsg
+            readmeMsg,
+            { forceRoot: false }
           );
         }
       });
